@@ -1,5 +1,5 @@
 from typing import Optional
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class Attorney(BaseModel):
@@ -27,7 +27,13 @@ class Attorney(BaseModel):
     menu_order: int = Field(ge=1)
     source_url: str = ""
     photo_url: str = ""
+    confidence: float = Field(default=0.0, ge=0, le=1)
+
+    @field_validator("status")
+    @classmethod
+    def status_is_publish(cls, value: str) -> str:
+        return "publish" if not value else value
 
     @property
     def is_publishable(self) -> bool:
-        return bool(self.name.strip() and self.practice_area.strip() and self.phone.strip() and self.about.strip())
+        return all(bool(getattr(self, k, "").strip()) for k in ("name", "practice_area", "phone", "about"))
