@@ -1,0 +1,34 @@
+cities:
+  - name: Phoenix
+    state: AZ
+    code: PHX
+  - name: Los Angeles
+    state: CA
+    code: LAX
+  - name: San Diego
+    state: CA
+    code: SAN
+  - name: San Francisco
+    state: CA
+    code: SFO
+  - name: Denver
+    state: CO
+    code: DEN
+  - name: Washington, D.C.
+    state: DC
+    code: DC
+  - name: Jacksonville
+    state: FL
+    code: JAX
+  - name: Miami
+    state: FL
+    code: MIA
+  - name: Atlanta
+    state: GA
+    code: ATL
+  - name: Chicago
+    state: IL
+    code: CHI
+  - name: Baltimore
+    state: MD
+    code: BAL
