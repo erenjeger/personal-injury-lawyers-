@@ -1,6 +1,4 @@
 import re
-from collections import defaultdict
-
 from models.attorney import Attorney
 
 
@@ -8,11 +6,26 @@ def attorney_id(code, number):
     return f"{code}-{number:03d}"
 
 
-def build_records(researcher, city, target=40, firm_limit=20, on_progress=None):
+def normalize_name(value):
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def quality_check(raw):
+    required = ("name", "practice_area", "phone", "about")
+    missing = [k for k in required if not str(raw.get(k, "")).strip()]
+    if missing:
+        return False, f"missing required field(s): {', '.join(missing)}"
+    combined = f"{raw.get('practice_area', '')} {raw.get('about', '')}".lower()
+    if not any(term in combined for term in ("personal injury", "car accident", "truck accident", "motorcycle accident", "wrongful death", "premises liability", "slip and fall", "injury lawyer", "injury attorney")):
+        return False, "not clearly personal-injury related"
+    if len(str(raw.get("about", ""))) < 150:
+        return False, "bio too short"
+    return True, "ok"
+
+
+def build_records(researcher, city, target=40, firm_limit=20, on_progress=None, min_confidence=0.45):
     firms = researcher.discover_firms(city["name"], city["state"], firm_limit)
-    records = []
-    seen_names = set()
-    failures = []
+    records, failures, seen_names, seen_urls = [], [], set(), set()
     for firm_index, firm in enumerate(firms, 1):
         if len(records) >= target:
             break
@@ -20,30 +33,35 @@ def build_records(researcher, city, target=40, firm_limit=20, on_progress=None):
         for page in pages:
             if len(records) >= target:
                 break
+            if page in seen_urls:
+                continue
+            seen_urls.add(page)
             raw = researcher.extract_profile(page, city["name"], city["state"], firm["name"])
             if not raw:
+                failures.append({"url": page, "reason": "page fetch/extraction failed", "name": "", "firm": firm["name"]})
                 continue
-            key = re.sub(r"[^a-z0-9]", "", raw.get("name", "").lower())
-            if not key or key in seen_names:
+            key = normalize_name(raw.get("name", ""))
+            if not key:
+                failures.append({"url": page, "reason": "name not detected", "name": "", "firm": firm["name"]})
                 continue
-            if not all(raw.get(k, "").strip() for k in ("name", "practice_area", "phone", "about")):
-                failures.append({"url": page, "reason": "missing required field", "name": raw.get("name", "")})
+            if key in seen_names:
                 continue
-            # The source requirement is specifically personal injury; avoid unrelated team profiles.
-            combined = (raw.get("practice_area", "") + " " + raw.get("about", "")).lower()
-            if "personal injury" not in combined and "personal-injury" not in combined:
+            ok, reason = quality_check(raw)
+            if not ok:
+                failures.append({"url": page, "reason": reason, "name": raw.get("name", ""), "firm": firm["name"]})
                 continue
-            seen_names.add(key)
+            if raw.get("confidence", 0) < min_confidence:
+                failures.append({"url": page, "reason": f"confidence below threshold: {raw.get('confidence')}", "name": raw.get("name", ""), "firm": firm["name"]})
+                continue
             n = len(records) + 1
-            raw["attorney_id"] = attorney_id(city["code"], n)
-            raw["menu_order"] = n
-            raw["status"] = "publish"
+            raw.update({"attorney_id": attorney_id(city["code"], n), "menu_order": n, "status": "publish"})
             try:
                 record = Attorney(**raw)
             except Exception as exc:
-                failures.append({"url": page, "reason": f"validation: {exc}", "name": raw.get("name", "")})
+                failures.append({"url": page, "reason": f"validation: {exc}", "name": raw.get("name", ""), "firm": firm["name"]})
                 continue
             records.append(record.model_dump())
+            seen_names.add(key)
             if on_progress:
                 on_progress(len(records), target, firm_index, len(firms))
     return records, failures
