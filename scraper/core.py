@@ -23,12 +23,13 @@ class WebResearcher:
         self.strict_robots = strict_robots
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (compatible; AttorneyResearchTool/2.1; +public-web-research)"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36 AttorneyResearchTool/2.1"
         })
         self._robots = {}
         self._cache = {}
-        self.stats = {"search_requests": 0, "pages_fetched": 0, "blocked_robots": 0, "failed_requests": 0}
+        self.stats = {"search_requests": 0, "pages_fetched": 0, "blocked_robots": 0, "failed_requests": 0, "firms_found": 0, "profile_pages_found": 0}
         self.last_search_error = ""
+        self.search_engine_used = ""
 
     def allowed(self, url: str) -> bool:
         p = urlparse(url)
@@ -42,7 +43,6 @@ class WebResearcher:
                 rp.read()
                 self._robots[root] = rp
             except Exception:
-                # If robots.txt is unavailable, allow normal low-rate requests unless strict mode is enabled.
                 self._robots[root] = None
         rp = self._robots[root]
         if rp is None:
@@ -75,33 +75,52 @@ class WebResearcher:
                     time.sleep(min(2 ** attempt, 4))
         return None
 
-    def search(self, query: str, limit: int = 30):
-        """Search-engine discovery only; the actual attorney data is always collected from first-party sites."""
-        url = "https://html.duckduckgo.com/html/?q=" + quote_plus(query)
-        self.stats["search_requests"] += 1
+    def _search_request(self, url: str):
         for attempt in range(self.max_retries + 1):
             try:
-                response = self.session.get(url, timeout=self.timeout, allow_redirects=True)
-                response.raise_for_status()
-                soup = BeautifulSoup(response.text, "html.parser")
-                anchors = soup.select("a.result__a")
-                if not anchors:
-                    # DDG occasionally changes markup; support result links using the result wrapper as fallback.
-                    anchors = [a for a in soup.select("a[href]") if a.get_text(" ", strip=True)]
-                results = []
-                for a in anchors[: limit * 3]:
-                    href = a.get("href", "")
-                    if href.startswith("http") and not self.is_directory(href):
-                        results.append((a.get_text(" ", strip=True), self.normalize_url(href)))
-                    if len(results) >= limit:
-                        break
-                self.last_search_error = ""
+                r = self.session.get(url, timeout=self.timeout, allow_redirects=True)
+                r.raise_for_status()
+                if "text/html" not in r.headers.get("content-type", "").lower():
+                    return None
                 time.sleep(self.delay)
-                return list(OrderedDict((u, (t, u)) for t, u in results).values())
+                return r
             except requests.RequestException as exc:
                 self.last_search_error = str(exc)
                 if attempt < self.max_retries:
                     time.sleep(min(2 ** attempt, 4))
+        return None
+
+    def search(self, query: str, limit: int = 30):
+        """Search-engine discovery only. Actual data is collected from first-party sites."""
+        engines = [
+            ("bing", "https://www.bing.com/search?q=" + quote_plus(query), "li.b_algo h2 a"),
+            ("duckduckgo", "https://html.duckduckgo.com/html/?q=" + quote_plus(query), "a.result__a"),
+            ("google", "https://www.google.com/search?q=" + quote_plus(query), "a"),
+        ]
+        for engine, url, selector in engines:
+            self.stats["search_requests"] += 1
+            response = self._search_request(url)
+            if not response:
+                continue
+            soup = BeautifulSoup(response.text, "html.parser")
+            anchors = soup.select(selector)
+            if engine == "google" and not anchors:
+                anchors = soup.select("div.MjjYud a")
+            results = []
+            for a in anchors:
+                href = a.get("href", "")
+                text = a.get_text(" ", strip=True)
+                if engine == "google" and href.startswith("/url?q="):
+                    href = href.split("/url?q=", 1)[1].split("&", 1)[0]
+                if href.startswith("http") and text and not self.is_directory(href):
+                    results.append((text, self.normalize_url(href)))
+                if len(results) >= limit:
+                    break
+            if results:
+                self.search_engine_used = engine
+                self.last_search_error = ""
+                return list(OrderedDict((u, (t, u)) for t, u in results).values())
+        self.last_search_error = self.last_search_error or "All configured search engines returned no usable results."
         return []
 
     @staticmethod
@@ -133,7 +152,9 @@ class WebResearcher:
                 seen_hosts.add(host)
                 firms.append({"name": self._firm_name(title), "url": url, "domain": host})
                 if len(firms) >= limit:
+                    self.stats["firms_found"] = len(firms)
                     return firms
+        self.stats["firms_found"] = len(firms)
         return firms
 
     @staticmethod
@@ -161,15 +182,19 @@ class WebResearcher:
             hay = f"{text} {href}".lower()
             if any(h in hay for h in BIO_HINTS):
                 candidates.append(href)
-        likely = sorted(set(candidates), key=lambda u: 0 if any(x in u.lower() for x in ("attorney", "lawyer", "team", "people", "bio")) else 1)
-        for href in likely[:12]:
+        # Common navigation labels that do not contain the word attorney.
+        for text, href in self._links(firm_url, soup):
+            if any(x in text.lower() for x in ("meet the team", "our attorneys", "our lawyers", "professionals", "people")):
+                candidates.append(href)
+        likely = sorted(set(candidates), key=lambda u: 0 if any(x in u.lower() for x in ("attorney", "lawyer", "team", "people", "bio", "profile")) else 1)
+        for href in likely[:15]:
             r = self.get(href)
             if not r:
                 continue
             s = BeautifulSoup(r.text, "html.parser")
             for text, link in self._links(href, s):
                 hay = f"{text} {link}".lower()
-                if any(h in hay for h in BIO_HINTS):
+                if any(h in hay for h in BIO_HINTS) or 2 <= len(text.split()) <= 6:
                     candidates.append(link)
             if len(candidates) >= max_pages:
                 break
@@ -179,6 +204,7 @@ class WebResearcher:
             if url not in seen and not self.is_directory(url):
                 seen.add(url)
                 unique.append(url)
+        self.stats["profile_pages_found"] += len(unique)
         return unique[:max_pages]
 
     @staticmethod
