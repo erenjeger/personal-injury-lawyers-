@@ -1,8 +1,16 @@
 from typing import Optional
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class Attorney(BaseModel):
+    """Validated attorney record.
+
+    The first 20 fields are the exact spreadsheet contract from the supplied
+    attorney-data-example.xlsx template. Internal provenance/quality fields
+    are kept after those columns and are never exported.
+    """
+
     model_config = ConfigDict(extra="ignore")
 
     attorney_id: str
@@ -25,6 +33,8 @@ class Attorney(BaseModel):
     callout_text: str = ""
     status: str = "publish"
     menu_order: int = Field(ge=1)
+
+    # Internal fields: intentionally excluded from the spreadsheet contract.
     source_url: str = ""
     photo_url: str = ""
     confidence: float = Field(default=0.0, ge=0, le=1)
@@ -36,4 +46,7 @@ class Attorney(BaseModel):
 
     @property
     def is_publishable(self) -> bool:
-        return all(bool(getattr(self, k, "").strip()) for k in ("name", "practice_area", "phone", "about"))
+        return all(
+            bool(getattr(self, key, "").strip())
+            for key in ("name", "practice_area", "phone", "about")
+        )
