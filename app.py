@@ -1,21 +1,33 @@
 from pathlib import Path
+
 import pandas as pd
 import streamlit as st
 import yaml
 
+from exporters.output import download_photos, write_csv, write_excel, zip_photos
 from scraper.core import WebResearcher
 from scraper.pipeline import build_records
-from exporters.output import write_excel, write_csv, download_photos, zip_photos
 
 BASE = Path(__file__).parent
 OUT = BASE / "output"
 OUT.mkdir(exist_ok=True)
 
-st.set_page_config(page_title="Attorney Research Automation", page_icon="⚖️", layout="wide")
-st.title("⚖️ Attorney Data Research Automation")
-st.caption("First-party law-firm research assistant for personal-injury attorney profiles")
+TEMPLATE_COLUMNS = [
+    "attorney_id", "name", "practice_area", "firm", "city", "state",
+    "licensed_states", "education", "affiliations", "badges", "photo",
+    "years_experience", "rating", "review_count", "phone", "languages",
+    "about", "callout_text", "status", "menu_order",
+]
 
-cities = yaml.safe_load((BASE / "config" / "cities.yaml").read_text())["cities"]
+st.set_page_config(
+    page_title="Attorney Research Automation",
+    page_icon="⚖️",
+    layout="wide",
+)
+st.title("⚖️ Attorney Data Research Automation")
+st.caption("First-party law-firm research assistant — output matches the supplied 20-column template")
+
+cities = yaml.safe_load((BASE / "config" / "cities.yaml").read_text(encoding="utf-8"))["cities"]
 
 with st.sidebar:
     st.header("Research settings")
@@ -82,42 +94,38 @@ if run:
 
     if all_records:
         status.success(
-            f"Finished: {len(all_records)} valid profiles. "
-            f"{len(all_failures)} records skipped."
+            f"Finished: {len(all_records)} valid profiles. {len(all_failures)} records skipped."
         )
     else:
         status.error(
-            "No valid profiles were found. Open Diagnostics below to see whether "
-            "search, robots.txt, or profile validation stopped the run."
+            "No valid profiles were found. Open Diagnostics below to identify the failing stage."
         )
 
 records = st.session_state.records
 failures = st.session_state.failures
 
 if records:
-    st.subheader("Results")
-    df = pd.DataFrame(records)
+    st.subheader("Results — exact template columns")
+    df = pd.DataFrame(records).reindex(columns=TEMPLATE_COLUMNS, fill_value="")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     c1.metric("Profiles", len(records))
     c2.metric("Cities", df["city"].nunique())
     c3.metric("Firms", df["firm"].nunique())
-    c4.metric(
-        "Avg confidence",
-        f"{df['confidence'].mean():.0%}" if "confidence" in df else "-",
-    )
 
     selected_cities = [
-        c
-        for c in cities
+        c for c in cities
         if c["name"] in df["city"].str.rsplit(", ", n=1).str[0].unique()
     ]
     write_excel(records, selected_cities, OUT / "attorney_research.xlsx")
     write_csv(records, OUT / "attorney_research.csv")
-    download_photos(records, OUT / "photos")
+    photo_results = download_photos(records, OUT / "photos")
     zip_photos(OUT / "photos", OUT / "photos.zip")
-    pd.DataFrame(failures).to_csv(OUT / "failed_records.csv", index=False)
+    pd.DataFrame(failures).to_csv(OUT / "failed_records.csv", index=False, encoding="utf-8-sig")
+
+    photo_ok = sum(1 for _, state, _ in photo_results if state == "ok")
+    st.caption(f"Photos downloaded: {photo_ok}/{len(records)}. The spreadsheet Photo column remains blank by design; photos are matched by attorney_id.")
 
     st.download_button(
         "⬇️ Download Excel",
@@ -147,17 +155,18 @@ with st.expander("🔎 Diagnostics", expanded=not bool(records)):
         d2.metric("Pages fetched", stats.get("pages_fetched", 0))
         d3.metric("Robots blocked", stats.get("blocked_robots", 0))
         d4.metric("Failed requests", stats.get("failed_requests", 0))
-
+        st.write({
+            "search_engine": researcher.search_engine_used if run else "",
+            "firms_found": stats.get("firms_found", 0),
+            "profile_pages_found": stats.get("profile_pages_found", 0),
+            "profiles_extracted": stats.get("profiles_extracted", 0),
+        })
         if stats.get("search_requests", 0) and stats.get("pages_fetched", 0) == 0:
             st.warning(
-                "Search/discovery produced no fetchable first-party pages. "
-                "This usually indicates a search-engine response/block or robots "
-                "policy issue, not an Excel/export problem."
+                "Search/discovery produced no fetchable pages. This is a discovery/network issue, not an Excel/export issue."
             )
     else:
         st.info("Run a small Phoenix test first. Diagnostics will appear here after the run.")
 
     if not records and not failures:
-        st.caption(
-            "Recommended smoke test: Phoenix → 2 attorneys → 2 firms → 0.5–1.0s delay."
-        )
+        st.caption("Recommended smoke test: Phoenix → 2 attorneys → 2 firms → 0.5–1.0s delay.")
