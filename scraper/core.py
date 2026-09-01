@@ -16,14 +16,19 @@ PI_TERMS = ("personal injury", "car accident", "truck accident", "motorcycle acc
 
 
 class WebResearcher:
-    def __init__(self, delay=1.5, timeout=20, max_retries=2):
+    def __init__(self, delay=1.5, timeout=20, max_retries=2, strict_robots=False):
         self.delay = delay
         self.timeout = timeout
         self.max_retries = max_retries
+        self.strict_robots = strict_robots
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "AttorneyResearchTool/2.0 (+public-web-research; respectful-rate-limit)"})
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (compatible; AttorneyResearchTool/2.1; +public-web-research)"
+        })
         self._robots = {}
         self._cache = {}
+        self.stats = {"search_requests": 0, "pages_fetched": 0, "blocked_robots": 0, "failed_requests": 0}
+        self.last_search_error = ""
 
     def allowed(self, url: str) -> bool:
         p = urlparse(url)
@@ -37,9 +42,15 @@ class WebResearcher:
                 rp.read()
                 self._robots[root] = rp
             except Exception:
+                # If robots.txt is unavailable, allow normal low-rate requests unless strict mode is enabled.
                 self._robots[root] = None
         rp = self._robots[root]
-        return rp is not None and rp.can_fetch(self.session.headers["User-Agent"], url)
+        if rp is None:
+            return not self.strict_robots
+        allowed = rp.can_fetch(self.session.headers["User-Agent"], url)
+        if not allowed:
+            self.stats["blocked_robots"] += 1
+        return allowed
 
     def get(self, url: str):
         url = self.normalize_url(url)
@@ -54,45 +65,69 @@ class WebResearcher:
                 if "text/html" not in response.headers.get("content-type", "").lower():
                     return None
                 self._cache[url] = response
+                self.stats["pages_fetched"] += 1
                 time.sleep(self.delay)
                 return response
-            except requests.RequestException:
+            except requests.RequestException as exc:
+                self.stats["failed_requests"] += 1
+                self.last_search_error = str(exc)
                 if attempt < self.max_retries:
                     time.sleep(min(2 ** attempt, 4))
         return None
+
+    def search(self, query: str, limit: int = 30):
+        """Search-engine discovery only; the actual attorney data is always collected from first-party sites."""
+        url = "https://html.duckduckgo.com/html/?q=" + quote_plus(query)
+        self.stats["search_requests"] += 1
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self.session.get(url, timeout=self.timeout, allow_redirects=True)
+                response.raise_for_status()
+                soup = BeautifulSoup(response.text, "html.parser")
+                anchors = soup.select("a.result__a")
+                if not anchors:
+                    # DDG occasionally changes markup; support result links using the result wrapper as fallback.
+                    anchors = [a for a in soup.select("a[href]") if a.get_text(" ", strip=True)]
+                results = []
+                for a in anchors[: limit * 3]:
+                    href = a.get("href", "")
+                    if href.startswith("http") and not self.is_directory(href):
+                        results.append((a.get_text(" ", strip=True), self.normalize_url(href)))
+                    if len(results) >= limit:
+                        break
+                self.last_search_error = ""
+                time.sleep(self.delay)
+                return list(OrderedDict((u, (t, u)) for t, u in results).values())
+            except requests.RequestException as exc:
+                self.last_search_error = str(exc)
+                if attempt < self.max_retries:
+                    time.sleep(min(2 ** attempt, 4))
+        return []
 
     @staticmethod
     def normalize_url(url: str) -> str:
         return url.split("#", 1)[0].rstrip("/")
 
     @staticmethod
-    def is_directory(url: str) -> bool:
-        host = urlparse(url).netloc.lower().removeprefix("www.")
-        return any(host == d or host.endswith("." + d) for d in DIRECTORY_DOMAINS)
+    def host(url: str) -> str:
+        return urlparse(url).netloc.lower().removeprefix("www.").split(":", 1)[0]
 
-    def search(self, query: str, limit: int = 30):
-        url = "https://html.duckduckgo.com/html/?q=" + quote_plus(query)
-        response = self.get(url)
-        if not response:
-            return []
-        soup = BeautifulSoup(response.text, "html.parser")
-        results = []
-        for a in soup.select("a.result__a")[:limit]:
-            href = a.get("href", "")
-            if href.startswith("http") and not self.is_directory(href):
-                results.append((a.get_text(" ", strip=True), self.normalize_url(href)))
-        return list(OrderedDict((u, (t, u)) for t, u in results).values())
+    @staticmethod
+    def is_directory(url: str) -> bool:
+        host = WebResearcher.host(url)
+        return any(host == d or host.endswith("." + d) for d in DIRECTORY_DOMAINS)
 
     def discover_firms(self, city: str, state: str, limit: int = 20):
         queries = [
             f'"{city}" "{state}" personal injury attorney',
             f'"{city}" "{state}" personal injury law firm',
             f'"{city}" personal injury lawyer',
+            f'personal injury attorney "{city}"',
         ]
         firms, seen_hosts = [], set()
         for q in queries:
             for title, url in self.search(q, limit=50):
-                host = urlparse(url).netloc.lower().removeprefix("www.")
+                host = self.host(url)
                 if host in seen_hosts or self.is_directory(url):
                     continue
                 seen_hosts.add(host)
@@ -109,9 +144,10 @@ class WebResearcher:
     @staticmethod
     def _links(base_url, soup):
         out = []
+        base_host = WebResearcher.host(base_url)
         for a in soup.find_all("a", href=True):
             href = urljoin(base_url, a["href"])
-            if href.startswith("http"):
+            if href.startswith("http") and WebResearcher.host(href) == base_host:
                 out.append((a.get_text(" ", strip=True), href))
         return out
 
@@ -140,7 +176,7 @@ class WebResearcher:
         unique, seen = [], set()
         for url in candidates:
             url = self.normalize_url(url)
-            if url not in seen and not self.is_directory(url) and urlparse(url).netloc == urlparse(firm_url).netloc:
+            if url not in seen and not self.is_directory(url):
                 seen.add(url)
                 unique.append(url)
         return unique[:max_pages]
@@ -157,21 +193,16 @@ class WebResearcher:
         return WebResearcher._clean(clone.get_text(" ", strip=True))
 
     @staticmethod
-    def _meta(soup, *names):
-        for name in names:
-            node = soup.find("meta", attrs={"name": name}) or soup.find("meta", attrs={"property": name})
-            if node and node.get("content"):
-                return WebResearcher._clean(node["content"])
-        return ""
-
-    @staticmethod
     def _jsonld(soup):
         import json
         objects = []
         for script in soup.find_all("script", type="application/ld+json"):
             try:
                 data = json.loads(script.string or script.get_text())
-                objects.extend(data if isinstance(data, list) else [data])
+                if isinstance(data, dict) and isinstance(data.get("@graph"), list):
+                    objects.extend(data["@graph"])
+                else:
+                    objects.extend(data if isinstance(data, list) else [data])
             except Exception:
                 continue
         return objects
@@ -187,13 +218,13 @@ class WebResearcher:
 
         name = ""
         for obj in jsonld:
-            if isinstance(obj, dict) and str(obj.get("@type", "")).lower() in {"person", "attorney"} and obj.get("name"):
+            if isinstance(obj, dict) and str(obj.get("@type", "")).lower() in {"person", "attorney", "legalservice"} and obj.get("name"):
                 name = self._clean(str(obj["name"]))
                 break
         if not name:
             for h in soup.find_all(["h1", "h2"]):
                 candidate = self._clean(h.get_text(" ", strip=True))
-                if 2 <= len(candidate.split()) <= 8 and not any(x in candidate.lower() for x in ("practice", "contact", "personal injury", "our team")):
+                if 2 <= len(candidate.split()) <= 8 and not any(x in candidate.lower() for x in ("practice", "contact", "personal injury", "our team", "meet our")):
                     name = candidate
                     break
         if not name:
@@ -210,12 +241,13 @@ class WebResearcher:
         image_url = ""
         for obj in jsonld:
             if isinstance(obj, dict) and obj.get("image"):
-                image_url = urljoin(url, obj["image"] if isinstance(obj["image"], str) else obj["image"].get("url", ""))
+                image = obj["image"]
+                image_url = urljoin(url, image if isinstance(image, str) else image.get("url", ""))
                 if image_url:
                     break
         if not image_url:
             for img in soup.find_all("img"):
-                src = img.get("src") or img.get("data-src") or img.get("data-lazy-src")
+                src = img.get("src") or img.get("data-src") or img.get("data-lazy-src") or img.get("data-original")
                 alt = (img.get("alt") or "").lower()
                 if src and ("attorney" in alt or "lawyer" in alt or (name and name.split()[0].lower() in alt)):
                     image_url = urljoin(url, src)
@@ -247,13 +279,12 @@ class WebResearcher:
 
     @staticmethod
     def _extract_section(soup, text, labels):
-        # First try headings and the next few sibling/list nodes for cleaner structured data.
         for heading in soup.find_all(re.compile("^h[1-6]$")):
             h = WebResearcher._clean(heading.get_text(" ", strip=True)).lower()
             if any(label in h for label in labels):
                 parts = []
                 node = heading.find_next_sibling()
-                for _ in range(4):
+                for _ in range(5):
                     if not node:
                         break
                     value = WebResearcher._clean(node.get_text(" ", strip=True))
