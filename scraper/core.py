@@ -10,6 +10,8 @@ from urllib.robotparser import RobotFileParser
 import requests
 from bs4 import BeautifulSoup
 
+from scraper.discovery import discover_firms_robust
+
 DIRECTORY_DOMAINS = {
     "findlaw.com", "avvo.com", "justia.com", "superlawyers.com", "lawyers.com",
     "martindale.com", "martindale-hubbell.com", "yelp.com", "yellowpages.com",
@@ -84,7 +86,6 @@ class WebResearcher:
         return bool(re.match(r"^https?://[^\s]+$", value or "", re.I))
 
     def _decode_bing_u(self, value: str) -> str:
-        """Decode Bing's common /ck/a tracking parameter when it contains a1 + base64."""
         if not value:
             return ""
         value = unquote(value)
@@ -92,7 +93,6 @@ class WebResearcher:
             return value
         if value.startswith("a1"):
             encoded = value[2:]
-            # Bing sometimes uses URL-safe or standard base64 without padding.
             encoded += "=" * (-len(encoded) % 4)
             for decoder in (base64.urlsafe_b64decode, base64.b64decode):
                 try:
@@ -105,7 +105,6 @@ class WebResearcher:
         return ""
 
     def unwrap_search_url(self, href: str) -> str:
-        """Turn search-engine redirect URLs into their real destination, or return ''."""
         if not href:
             return ""
         href = unquote(href.strip())
@@ -119,7 +118,6 @@ class WebResearcher:
             return ""
         if not self.is_search_engine(href):
             return self.normalize_url(href)
-
         params = parse_qs(parsed.query)
         for key in ("uddg", "url", "target", "dest", "destination", "q"):
             for candidate in params.get(key, []):
@@ -131,8 +129,6 @@ class WebResearcher:
                 decoded = self._decode_bing_u(candidate)
                 if self._looks_like_url(decoded) and not self.is_search_engine(decoded):
                     return self.normalize_url(decoded)
-
-        # Last resort: resolve a tracking link. Never return the search-engine URL itself.
         try:
             r = self.session.get(href, timeout=min(self.timeout, 10), allow_redirects=True, stream=True)
             final_url = self.normalize_url(r.url)
@@ -242,7 +238,7 @@ class WebResearcher:
                 self.search_engine_used = engine
                 self.last_search_error = ""
                 return list(OrderedDict((u, (t, u)) for t, u in results).values())
-        self.last_search_error = self.last_search_error or "All configured search engines returned no usable first-party URLs."
+        self.last_search_error = self.last_search_error or "All configured search engines returned no usable URLs."
         return []
 
     def _is_likely_firm_page(self, response, city: str, state: str) -> bool:
@@ -259,28 +255,7 @@ class WebResearcher:
         return term_hits >= 2 and (pi_hits >= 1 or (city_hit and state_hit))
 
     def discover_firms(self, city: str, state: str, limit: int = 20):
-        queries = [
-            f'"{city}" "{state}" personal injury attorney',
-            f'"{city}" "{state}" personal injury law firm',
-            f'"{city}" personal injury lawyer',
-            f'personal injury attorney "{city}"',
-        ]
-        firms, seen_hosts = [], set()
-        for query in queries:
-            for title, url in self.search(query, limit=50):
-                host = self.host(url)
-                if not host or host in seen_hosts or self.is_directory(url) or self.is_search_engine(url):
-                    continue
-                response = self.get(url)
-                if not response or not self._is_likely_firm_page(response, city, state):
-                    continue
-                seen_hosts.add(host)
-                firms.append({"name": self._firm_name(title), "url": url, "domain": host})
-                if len(firms) >= limit:
-                    self.stats["firms_found"] = len(firms)
-                    return firms
-        self.stats["firms_found"] = len(firms)
-        return firms
+        return discover_firms_robust(self, city, state, limit)
 
     @staticmethod
     def _firm_name(title: str) -> str:
