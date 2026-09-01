@@ -1,8 +1,10 @@
+import base64
+import binascii
 import json
 import re
 import time
 from collections import OrderedDict
-from urllib.parse import quote_plus, urljoin, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
 import requests
@@ -13,6 +15,9 @@ DIRECTORY_DOMAINS = {
     "martindale.com", "martindale-hubbell.com", "yelp.com", "yellowpages.com",
     "lawinfo.com", "nolo.com", "lawyers.findlaw.com", "lawtally.com",
 }
+SEARCH_ENGINE_DOMAINS = {
+    "bing.com", "google.com", "duckduckgo.com", "yahoo.com", "search.brave.com",
+}
 BIO_HINTS = (
     "attorney", "lawyer", "our-team", "team", "professionals", "people",
     "bio", "profile", "lawyers", "attorneys", "staff",
@@ -21,6 +26,10 @@ PI_TERMS = (
     "personal injury", "car accident", "truck accident", "motorcycle accident",
     "wrongful death", "premises liability", "slip and fall", "product liability",
     "pedestrian accident", "catastrophic injury", "injury lawyer", "injury attorney",
+)
+LAW_FIRM_TERMS = (
+    "law firm", "law office", "attorneys", "attorney at law", "lawyers",
+    "personal injury", "practice areas", "contact our office", "free consultation",
 )
 BADGE_PATTERNS = {
     "free_consultation": ("free consultation", "free initial consultation", "complimentary consultation"),
@@ -37,7 +46,7 @@ class WebResearcher:
         self.strict_robots = strict_robots
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36 AttorneyResearchTool/3.0"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36 AttorneyResearchTool/3.1"
         })
         self._robots = {}
         self._cache = {}
@@ -51,6 +60,9 @@ class WebResearcher:
 
     @staticmethod
     def normalize_url(url: str) -> str:
+        if not url:
+            return ""
+        url = unquote(url.strip())
         return url.split("#", 1)[0].rstrip("/")
 
     @staticmethod
@@ -58,9 +70,78 @@ class WebResearcher:
         return urlparse(url).netloc.lower().removeprefix("www.").split(":", 1)[0]
 
     @staticmethod
+    def is_search_engine(url: str) -> bool:
+        host = WebResearcher.host(url)
+        return any(host == d or host.endswith("." + d) for d in SEARCH_ENGINE_DOMAINS)
+
+    @staticmethod
     def is_directory(url: str) -> bool:
         host = WebResearcher.host(url)
         return any(host == d or host.endswith("." + d) for d in DIRECTORY_DOMAINS)
+
+    @staticmethod
+    def _looks_like_url(value: str) -> bool:
+        return bool(re.match(r"^https?://[^\s]+$", value or "", re.I))
+
+    def _decode_bing_u(self, value: str) -> str:
+        """Decode Bing's common /ck/a tracking parameter when it contains a1 + base64."""
+        if not value:
+            return ""
+        value = unquote(value)
+        if self._looks_like_url(value):
+            return value
+        if value.startswith("a1"):
+            encoded = value[2:]
+            # Bing sometimes uses URL-safe or standard base64 without padding.
+            encoded += "=" * (-len(encoded) % 4)
+            for decoder in (base64.urlsafe_b64decode, base64.b64decode):
+                try:
+                    decoded = decoder(encoded).decode("utf-8", errors="ignore")
+                    match = re.search(r"https?://[^\x00\"'<>\s]+", decoded)
+                    if match:
+                        return unquote(match.group(0))
+                except (ValueError, UnicodeError, binascii.Error):
+                    continue
+        return ""
+
+    def unwrap_search_url(self, href: str) -> str:
+        """Turn search-engine redirect URLs into their real destination, or return ''."""
+        if not href:
+            return ""
+        href = unquote(href.strip())
+        if href.startswith("//"):
+            href = "https:" + href
+        if href.startswith("/"):
+            return ""
+        parsed = urlparse(href)
+        host = self.host(href)
+        if not parsed.scheme or parsed.scheme not in {"http", "https"}:
+            return ""
+        if not self.is_search_engine(href):
+            return self.normalize_url(href)
+
+        params = parse_qs(parsed.query)
+        for key in ("uddg", "url", "target", "dest", "destination", "q"):
+            for candidate in params.get(key, []):
+                candidate = unquote(candidate)
+                if self._looks_like_url(candidate) and not self.is_search_engine(candidate):
+                    return self.normalize_url(candidate)
+        if host.endswith("bing.com"):
+            for candidate in params.get("u", []):
+                decoded = self._decode_bing_u(candidate)
+                if self._looks_like_url(decoded) and not self.is_search_engine(decoded):
+                    return self.normalize_url(decoded)
+
+        # Last resort: resolve a tracking link. Never return the search-engine URL itself.
+        try:
+            r = self.session.get(href, timeout=min(self.timeout, 10), allow_redirects=True, stream=True)
+            final_url = self.normalize_url(r.url)
+            r.close()
+            if final_url and not self.is_search_engine(final_url):
+                return final_url
+        except requests.RequestException:
+            pass
+        return ""
 
     def allowed(self, url: str) -> bool:
         p = urlparse(url)
@@ -85,6 +166,8 @@ class WebResearcher:
 
     def get(self, url: str):
         url = self.normalize_url(url)
+        if not url or self.is_search_engine(url):
+            return None
         if url in self._cache:
             return self._cache[url]
         if not self.allowed(url):
@@ -130,9 +213,9 @@ class WebResearcher:
             ("duckduckgo", "https://html.duckduckgo.com/html/?q=" + quote_plus(query), "a.result__a"),
             ("google", "https://www.google.com/search?q=" + quote_plus(query), "div.MjjYud a"),
         ]
-        for engine, url, selector in engines:
+        for engine, search_url, selector in engines:
             self.stats["search_requests"] += 1
-            response = self._search_request(url)
+            response = self._search_request(search_url)
             if not response:
                 continue
             soup = BeautifulSoup(response.text, "html.parser")
@@ -140,21 +223,40 @@ class WebResearcher:
             if engine == "google" and not anchors:
                 anchors = soup.find_all("a", href=True)
             results = []
+            seen = set()
             for a in anchors:
-                href = a.get("href", "")
+                raw_href = a.get("href", "")
                 text = self._clean(a.get_text(" ", strip=True))
-                if href.startswith("/url?q="):
-                    href = href.split("/url?q=", 1)[1].split("&", 1)[0]
-                if href.startswith("http") and text and not self.is_directory(href):
-                    results.append((text, self.normalize_url(href)))
+                if not text:
+                    continue
+                href = self.unwrap_search_url(raw_href)
+                if not href or href in seen:
+                    continue
+                if self.is_directory(href) or self.is_search_engine(href):
+                    continue
+                seen.add(href)
+                results.append((text, href))
                 if len(results) >= limit:
                     break
             if results:
                 self.search_engine_used = engine
                 self.last_search_error = ""
                 return list(OrderedDict((u, (t, u)) for t, u in results).values())
-        self.last_search_error = self.last_search_error or "All configured search engines returned no usable results."
+        self.last_search_error = self.last_search_error or "All configured search engines returned no usable first-party URLs."
         return []
+
+    def _is_likely_firm_page(self, response, city: str, state: str) -> bool:
+        if not response:
+            return False
+        soup = BeautifulSoup(response.text, "html.parser")
+        title = self._clean(soup.title.get_text(" ", strip=True) if soup.title else "")
+        text = self._visible_text(soup)[:30000].lower()
+        haystack = f"{title.lower()} {text}"
+        term_hits = sum(1 for term in LAW_FIRM_TERMS if term in haystack)
+        pi_hits = sum(1 for term in PI_TERMS if term in haystack)
+        city_hit = city.lower() in haystack
+        state_hit = state.lower() in haystack
+        return term_hits >= 2 and (pi_hits >= 1 or (city_hit and state_hit))
 
     def discover_firms(self, city: str, state: str, limit: int = 20):
         queries = [
@@ -167,7 +269,10 @@ class WebResearcher:
         for query in queries:
             for title, url in self.search(query, limit=50):
                 host = self.host(url)
-                if host in seen_hosts or self.is_directory(url):
+                if not host or host in seen_hosts or self.is_directory(url) or self.is_search_engine(url):
+                    continue
+                response = self.get(url)
+                if not response or not self._is_likely_firm_page(response, city, state):
                     continue
                 seen_hosts.add(host)
                 firms.append({"name": self._firm_name(title), "url": url, "domain": host})
@@ -222,7 +327,7 @@ class WebResearcher:
         unique, seen = [], set()
         for url in candidates:
             url = self.normalize_url(url)
-            if url not in seen and not self.is_directory(url) and url != self.normalize_url(firm_url):
+            if url not in seen and not self.is_directory(url) and not self.is_search_engine(url) and url != self.normalize_url(firm_url):
                 seen.add(url)
                 unique.append(url)
         self.stats["profile_pages_found"] += len(unique)
@@ -264,7 +369,6 @@ class WebResearcher:
             containers.extend(soup.select(selector))
         if not containers:
             return soup
-        # Prefer a container with both a person's name and a substantial amount of text.
         return max(containers, key=lambda x: len(self._text_from_node(x)))
 
     def _visible_text(self, node):
@@ -274,7 +378,6 @@ class WebResearcher:
         return self._clean(clone.get_text(" ", strip=True))
 
     def _bio_text(self, container):
-        # Keep the complete profile content while removing obvious navigation/contact noise.
         clone = BeautifulSoup(str(container), "html.parser")
         for tag in clone(["script", "style", "noscript", "svg", "nav", "footer", "header", "form"]):
             tag.decompose()
@@ -384,9 +487,8 @@ class WebResearcher:
         }.items():
             if re.search(rf"\b{re.escape(abbr)}\b", raw) or re.search(rf"\b{re.escape(full)}\b", raw, re.I):
                 states.append(abbr)
-        if not states and state:
-            if re.search(rf"\b{re.escape(state)}\b", raw):
-                states.append(state)
+        if not states and state and re.search(rf"\b{re.escape(state)}\b", raw):
+            states.append(state)
         return "|".join(dict.fromkeys(states))
 
     def _simple_section(self, container, text, labels):
@@ -423,10 +525,10 @@ class WebResearcher:
         matches = re.findall(r"\b(\d{1,2})\s*\+?\s*years?\s+(?:of\s+)?experience\b", text, flags=re.I)
         if matches:
             return int(max(matches, key=int))
+        current_year = time.localtime().tm_year
         years = re.findall(r"(?:admitted|licensed|bar admission|joined the bar)[^\d]{0,80}(?:19|20)(\d{2})", text, flags=re.I)
         if years:
-            admission_year = int("20" + years[0]) if len(years[0]) == 2 else int(years[0])
-            current_year = time.localtime().tm_year
+            admission_year = int("20" + years[0])
             if 1950 <= admission_year <= current_year:
                 return current_year - admission_year
         return None
